@@ -56,10 +56,12 @@ def rollout(policy):
 
     xs = [np.zeros(2)]; us = []; rs= [];
     dt = 0.05
+    # we will compute a policy for a 10 second trajectory, with a 0.05 time-step and T=200 time-steps
     for t in np.arange(0, 10, dt):
         # The interface between PyTorch and numpy becomes a bit funny
         # but all that this line is doing is that it is running u(x) to get
         # a control for one state x
+        # @ x0, this is the initial state and the control policy will be an initial control policy. 
         u = policy(th.from_numpy(xs[-1]).view(1,-1).float())[0].detach().numpy().squeeze().item()
 
         z, zdot = xs[-1][0], xs[-1][1]
@@ -70,6 +72,8 @@ def rollout(policy):
         us.append(u)
         xs.append(np.array([zp, zdotp]))
 
+    # For a single trajectory, this is an appropriate way to compute the sum of discounted rewards
+    # For a multi-trajectory, input space, this will only compute the sum of discounted rewards for a single trajectory. 
     R = sum([rr*gamma**k for k,rr in enumerate(rs)])
     return {'x': th.tensor(xs[:-1]).float(),
             'u': th.tensor(us).float(),
@@ -106,10 +110,77 @@ def example_train():
 
 def train():
     """
-    TODO: XXXXXXXXXXXX
-    This is very similar to example_tran() above. You should sample
-    multiple trajectory at each iteration and run the training for about 1000
+    Sample multiple trajectory at each iteration and run the training for about 1000
     iterations. You should track the average value of the return across multiple
     trajectories and plot it as a function of the number of iterations.
     """
-    pass
+    NUM_TRAJECTORIES = 100
+    NUM_ITERATIONS = 1000
+    # xdim = 2 * NUM_TRAJECTORIES
+    # udim = 1 * NUM_TRAJECTORIES 
+    xdim = 2
+    udim = 1
+    policy = u_t(xdim, udim)
+    optim = th.optim.Adam(policy.parameters(), lr=1e-3)
+
+    # Create a zeta normal distribution with mean of zero, and standard deviation of 
+    ts = []
+    logps = []
+    grad_logps = []
+    fs = []
+    for i in range(NUM_TRAJECTORIES):
+        """
+        1. get multiple trjaectories
+        """
+        t = rollout(policy)
+        ts.append(t)
+
+    """"
+    2. We now want to calculate grad log u_theta(u | x), so we will feed all 
+    the states from the trajectory again into the network and this time we are 
+    interested in the log-probabilities.
+    """
+    policy_grads = []
+    for i in range(NUM_TRAJECTORIES):
+        states = ts[i]['x'].view(-1,2)
+        actions = ts[i]['u'].view(-1,1)
+        returns = ts[i]['r']
+        Rs = ts[i]['R']
+
+        logp = policy(states, actions)[1]
+        # Compute the policy gradient objective for updating the weights
+        grad_logp = th.autograd.grad(logp.sum(), policy.parameters(), retain_graph=True)
+        policy_grads.append(grad_logp)
+
+    weighted_policy_grads = []
+    for i in range(NUM_TRAJECTORIES):
+        # Weight the policy gradient by the return
+        grad_logp = [g * Rs for g in policy_grads[i]] 
+        weighted_policy_grads.append(grad_logp)
+
+    # grad_logps.append(grad_logp)
+    # fs.append(f)
+
+    # update the weights of the model using the trajectories
+    for g in weighted_policy_grads:
+        # average the gradients across all trajectories
+        pass
+
+    
+    # zero_grad is a PyTorch peculiarity that clears the backpropagation
+    # gradient buffer before calling the next .backward()
+    # policy.zero_grad()
+    # # .backward computes the gradient of the policy gradient objective with respect
+    # # to the parameters of the policy and stores it in the gradient buffer
+    # f.backward()
+    # # .step() updates the weights of the policy using the computed gradient
+    # optim.step()
+
+
+def main():
+    """
+    This is the main function that runs the training loop
+    """
+    train()
+
+main()
