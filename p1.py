@@ -4,7 +4,13 @@ import torch
 import torch.nn as nn
 from torch.distributions import Normal
 from tqdm import tqdm
+from itertools import product
+import matplotlib
 import matplotlib.pyplot as plt
+import matplotlib.animation as FuncAnimation
+
+matplotlib.use('Qt5Agg')
+plt.rcParams['figure.raise_window'] = False
 
 # Check if CUDA is available
 # if torch.cuda.is_available():
@@ -61,12 +67,79 @@ class u_t(nn.Module):
         return u, logp
     
 def get_rev(z, zdot, u): 
-    return -0.5*((np.pi-z)**2 + zdot**2 + 0.01*u**2)
+    return -0.5*((np.pi-(z % (np.pi * 2)))**2 + zdot**2 + 0.01*u**2)
 
 def test_policy(policy, z, zdot): 
     return policy(torch.tensor([[z, zdot]]))
 
-def rollout(policy):
+# Evaluation function
+def evaluate_policy(policy, device='cpu', max_steps=100, animate=True):
+    """
+    Evaluate the policy by running a rollout and plotting the arm's angle over time.
+    
+    Args:
+        policy: Trained policy network (e.g., u_t instance).
+        device: Device for computations ('cpu' or 'cuda').
+        max_steps: Maximum steps for the rollout.
+        animate: If True, show an animation of the arm's motion.
+    
+    Returns:
+        None (displays plots and animation).
+    """
+    # Run rollout
+    trajectory = rollout(policy, device, max_steps)
+    states = trajectory['x'].cpu().numpy()  # [time, 2]
+    angles = states[:, 0]  # theta (radians)
+    time_steps = np.arange(max_steps)
+
+    # Static plot: Angle vs. Time
+    plt.figure(figsize=(10, 6))
+    plt.plot(time_steps, angles, 'b-', label='Angle (θ)')
+    plt.axhline(y=np.pi, color='r', linestyle='--', label='Goal (θ = π, upright)')
+    plt.xlabel('Time Step')
+    plt.ylabel('Angle (radians)')
+    plt.title('Robotic Arm Angle Over Time')
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig('arm_angle_plot.png')
+    plt.show(block=False)
+
+    # Animation: Arm rotation around axle
+    if animate:
+        fig, ax = plt.subplots(figsize=(8, 8))
+        ax.set_xlim(-1.5, 1.5)
+        ax.set_ylim(-1.5, 1.5)
+        ax.set_aspect('equal')
+        ax.grid(True)
+        ax.set_title('Robotic Arm Motion')
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        
+        # Arm representation: line from origin to (sin(θ), -cos(θ))
+        # (θ = 0 is down, θ = π is up)
+        line, = ax.plot([], [], 'b-', linewidth=4, label='Arm')
+        ax.plot([0], [0], 'ko', markersize=10, label='Axle')
+        ax.legend()
+
+        def init():
+            line.set_data([], [])
+            return line,
+
+        def update(frame):
+            theta = angles[frame]
+            # Arm endpoint: (sin(θ), -cos(θ)) for length 1
+            x = [0, np.sin(theta)]
+            y = [0, -np.cos(theta)]
+            line.set_data(x, y)
+            return line,
+
+        ani = FuncAnimation(fig, update, frames=max_steps, init_func=init,
+                           blit=True, interval=50)  # 50ms per frame
+        ani.save('arm_motion.gif', writer='pillow', fps=20)
+        plt.show(block=False)
+
+def rollout(policy, gamma=0.99):
     """
     We will use the control u_theta(x_t) to take the control action at each
     timestep. You can use simple Euler integration to simulate the ODE forward
@@ -98,44 +171,6 @@ def rollout(policy):
     return {'x': torch.tensor(xs[:-1]).float(),
             'u': torch.tensor(us).float(),
             'r': torch.tensor(rs).float(), 'R': R}
-
-# def rollout(policy):
-#     """
-#     We will use the control u_theta(x_t) to take the control action at each
-#     timestep. You can use simple Euler integration to simulate the ODE forward
-#     for T = 200 timesteps with discretization dt=0.05.
-#     At each time-step, you should record the state x,
-#     control u, and the reward r
-#     """
-#     horizon = 10
-#     dt = 0.05
-# 
-#     T = math.floor(horizon / dt)
-#     xs = torch.zeros(2, dtype=torch.float32)[None, None, ...].repeat((T+1, 1, 1)).to(device)
-#     us = torch.zeros((T, 1), dtype=torch.float32, device=device)
-#     rs = torch.zeros((T, 1), dtype=torch.float32, device=device)
-#     # we will compute a policy for a <horizon> second trajectory, with a 0.05 time-step and T=200 time-steps
-#     for i, t in enumerate(np.arange(0, horizon, dt)):
-#         # x0, this is the initial state and the control policy will be an initial control policy. 
-#         states = xs[i].view(1,-1).to(device)
-#         u = policy(states)[0]
-# 
-#         z, zdot = xs[i][0][0], xs[i][0][1]
-#         zp = z + zdot*dt
-#         zdotp = zdot + dt*(u - m*g*l*torch.sin(z) - b*zdot)/m/l**2
-# 
-#         rs[i] = get_rev(z, zdot, u)
-#         us[i] = u
-#         xs[i+1, 0, 0] = zp
-#         xs[i+1, 0, 1] = zdotp
-# 
-#     # For a single trajectory, this is an appropriate way to compute the sum of discounted rewards
-#     # For a multi-trajectory, input space, this will only compute the sum of discounted rewards for a single trajectory. 
-#     R = sum([rr*gamma**k for k, rr in enumerate(rs)])
-#     return {'x': xs[:-1].requires_grad_(),
-#             'u': us.requires_grad_(),
-#             'r': rs, 
-#             'R': R}
 
 def example_train():
     """
@@ -172,30 +207,44 @@ def train():
     iterations. You should track the average value of the return across multiple
     trajectories and plot it as a function of the number of iterations.
     """
-    NUM_TRAJECTORIES = [2, 4, 8, 12, 16, 32]
+    param_grid = {
+        'num_trajectories': [32, 64],
+        'gamma': [0.995, 0.99] # [0.85, 0.80, 0.75, 0.7, 0.65]
+    }
+    
+    parameter_combinations = product(*param_grid.values())
+
     NUM_ITERATIONS = 1000
     RETURN_MIN = 100 
     xdim = 3
     udim = 1
 
     best_return = -100000000
-    best_returns = []
+    best_returns = None 
     best_policy = None
-    best_n_trajectories = 10000
-    for N_TRAJECTORIES in NUM_TRAJECTORIES:
+    best_n_trajectories = None
+    best_paramsd = None
+    for params in parameter_combinations:
+        paramsd = dict(zip(param_grid.keys(), params))
+        print("Training with ", paramsd)
+
         policy = u_t(xdim, udim)
+        target_policy = u_t(xdim, udim).to(device)
+        target_policy.load_state_dict(policy.state_dict())  # Copy initial weights
         optim = torch.optim.Adam(policy.parameters(), lr=1e-3)
         policy.to(device)
         # optim.to(device)
 
+        tau = 0.995
+
         plt.ion()  # Turn on interactive mode
-        fig, ax = plt.subplots(2,1)
+        fig, ax = plt.subplots(2,1, figsize=(16, 10))
         ax[0].set_ylabel("Average Return")
         ax[0].set_title("Average Return vs. Iteration")
         ax[0].grid(True)
         ax[1].set_xlabel("Iteration")
         ax[1].set_ylabel("Average weighted f_means")
-        ax[1].set_title("Average weighted f_means loss vs. Iteration")
+        ax[1].set_title("Average weighted f_means vs. Iteration")
         ax[1].grid(True)
         line1, = ax[0].plot([], [], 'b-')  # Initialize empty plot line
         line2, = ax[1].plot([], [], 'g-')  # Initialize empty plot line
@@ -203,30 +252,32 @@ def train():
         iterations = []
         avg_returns = []
         iteration = 0
-        # losses = []
         f_means = []
         for iteration in (piterbar := tqdm(range(NUM_ITERATIONS))):
             ts = []
             logps = []
             fs = []
-            # loss = 0
-            for i in (ptrajbar := tqdm(range(N_TRAJECTORIES), leave=False)):
-            # for i in range(NUM_TRAJECTORIES):
+            bnums = []
+            bdems = []
+            Rs = []
+            for i in (ptrajbar := tqdm(range(paramsd['num_trajectories']), leave=False)):
                 """
                 1. get multiple trjaectories
                 """
                 t = rollout(policy)
                 ts.append(t)
-
+                
+            for i in (ptrajbar := tqdm(range(paramsd['num_trajectories']), leave=False)):
                 """"
                 2. We now want to calculate grad log u_theta(u | x), so we will feed all 
                 the states from the trajectory again into the network and this time we are 
                 interested in the log-probabilities.
                 """
-                states = ts[-1]['x'].view(-1,2)# .to(device)
-                actions = ts[-1]['u'].view(-1,1)# .to(device)
-                # returns = ts[-1]['r'].to(device)
-                Rs = ts[-1]['R']
+
+                states = ts[i]['x'].view(-1,2)# .to(device)
+                actions = ts[i]['u'].view(-1,1)# .to(device)
+                returns = ts[i]['r']
+                R = -ts[-1]['R']
 
                 logp = policy(states, actions)[1]
                 # Compute the policy gradient objective for updating the weights
@@ -234,36 +285,47 @@ def train():
                 # policy_grads.append(grad_logp)
                 logps.append(logp)
 
-                f = -(Rs*logp).mean()
+                Rs.append(-R)
+
+                bnums.append(logp**2 * R)
+                bdems.append(logp**2)
+
+            # Compute baseline (b)
+            # b = 0
+            # Optional: uncomment to use your baseline
+            b = ((sum(bnums) / len(bnums)) / (sum(bdems) / len(bdems)))
+
+            # 2. Compute policy gradient objective
+            for i in tqdm(range(paramsd['num_trajectories']), leave=False):
+                logp = logps[i]
+                f = -((Rs[i] - b) * logp).mean()
                 fs.append(f)
 
-                # loss += f
+            # Average policy gradient loss
+            f_mean = torch.stack(fs).mean()
+            f_means.append(f_mean.item())
 
-                # print(f"Trajectory {i}, f: {f} average logp loss, R: {Rs}")
-                ptrajbar.set_description(f"Trajectory {i}, f: {f} average logp loss, R: {Rs}")
-
-            # Compute the average of the logp policy gradient losses across all trajectories
-            f_mean = torch.tensor(fs).mean()
-            f_means.append(f_mean)
-            # loss /= NUM_TRAJECTORIES
-            # losses.append(loss.item())
-
+            # Backprop and update main policy
             policy.zero_grad()
-            # Compute the gradient of the policy gradient objective with respect to the parameters
-            # of the policy and store it in the gradient buffer
             f_mean.backward()
             optim.step()
+
+            # Update target policy with EMA
+            with torch.no_grad():
+                for param, target_param in zip(policy.parameters(), target_policy.parameters()):
+                    target_param.data.mul_(tau).add_((0 - tau) * param.data)
 
             # Track average return
             returns = [t['R'].item() for t in ts]
             avg_return = np.mean(returns)
             avg_returns.append(avg_return)
 
+            # f_means_copy = [f_mean.detach() for f_mean in f_means]
             iterations.append(iteration)
             # Update plot for Average Return (line1)
             line1.set_xdata(iterations)
             line1.set_ydata(avg_returns)
-            # Update plot for Train Loss (line2)
+            # Update plot for Train fmeans (line2)
             line2.set_xdata(iterations)
             line2.set_ydata(f_means)
 
@@ -279,18 +341,28 @@ def train():
             plt.pause(0.01)  # Small pause to allow plot update
 
             # Print progress
-            # print(f"Iteration {iteration}/{NUM_ITERATIONS}, Avg Return: {avg_return:.2f}, Loss: {loss:.2f}")
             piterbar.set_description(f"Iteration {iteration}/{NUM_ITERATIONS}, Avg Return: {avg_return:.2f}")
 
             if avg_return > RETURN_MIN:
                 print(f"Finished training, return={avg_return.item()}")
                 break;
 
-        if best_return > avg_returns[-1]:
+        # plt.savefig(f"p1_policy_nob_{paramsd['num_trajectories']}_{paramsd['gamma']}_{iteration}.jpg")
+        plt.savefig(f"p1_policy_{paramsd['num_trajectories']}_{paramsd['gamma']}_{iteration}.jpg")
+        plt.close()
+
+        if best_return < avg_returns[-1]:
             best_return = avg_returns[-1]
             best_returns = avg_returns
-            best_n_trajectories = N_TRAJECTORIES
+            best_n_trajectories = paramsd['num_trajectories']
             best_policy = policy
+            best_paramsd = paramsd
+
+    evaluate_policy(policy, device, max_steps=200, animate=True)
+
+    print(f"best n_trajectories={best_n_trajectories}; best return={best_return}")
+
+    torch.save(best_policy, f"p1_policy_{paramsd['num_trajectories']}_{paramsd['gamma']}_{iteration}.pth")
 
     return best_policy, best_returns
 
@@ -299,6 +371,7 @@ def main():
     This is the main function that runs the training loop
     """
     policy, returns = train()
+
     # example_train()
 
 main()
